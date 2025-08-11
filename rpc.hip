@@ -4,6 +4,8 @@
 
 #include <shared/rpc.h>
 
+constexpr int PINGS = 100000;
+
 __device__ rpc::Server server;
 
 [[noreturn]] void handle_error(hipError_t err) {
@@ -49,14 +51,13 @@ __global__ void kernel() {
 
 void ping(rpc::Client &client) {
   uint64_t n = 0;
-  for (int i = 0; i < 64; ++i) {
+  for (int i = 0; i < PINGS; ++i) {
     rpc::Client::Port port = client.open<RPC_PING>();
     port.send_and_recv(
         [&](rpc::Buffer *buffer, uint32_t) { buffer->data[0] = n; },
         [&](rpc::Buffer *buffer, uint32_t) { n = buffer->data[0]; });
     port.close();
   }
-  printf("Pinged %lu times\n", n);
 }
 
 void exit(rpc::Client &client) {
@@ -75,10 +76,10 @@ int main() {
   void *rpc_buffer = nullptr;
   if (hipError_t err = hipHostMalloc(
           &rpc_buffer,
-          rpc::Server::allocation_size(num_lanes, rpc::MAX_PORT_COUNT)))
+          rpc::Server::allocation_size(num_lanes, 1)))
     handle_error(err);
-  rpc::Server server_(rpc::MAX_PORT_COUNT, rpc_buffer);
-  rpc::Client client(rpc::MAX_PORT_COUNT, rpc_buffer);
+  rpc::Server server_(1, rpc_buffer);
+  rpc::Client client(1, rpc_buffer);
 
   // Initialize the client on the device so it can communicate with the
   // server.
@@ -91,14 +92,28 @@ int main() {
     handle_error(err);
 
   // Execute the kernel.
-  hipLaunchKernelGGL(kernel, dim3(100), dim3(256), 0, stream);
+  hipEvent_t start, stop;
+  if (hipError_t err = hipEventCreate(&start))
+    handle_error(err);
+  if (hipError_t err = hipEventCreate(&stop))
+    handle_error(err);
+
+  if (hipError_t err = hipEventRecord(start, stream))
+    handle_error(err);
+  hipLaunchKernelGGL(kernel, dim3(1), dim3(1), 0, stream);
 
   // While the kernel is executing, submit work for the RPC server to do.
   // Requires non-blocking HIP kernels but avoids a separate thread.
   ping(client);
   exit(client);
 
-  // Wait until the kernel exits.
-  while (hipStreamQuery(stream) == hipErrorNotReady)
-    ;
+  if (hipError_t err = hipEventRecord(stop, stream))
+    handle_error(err);
+  if (hipError_t err = hipEventSynchronize(stop))
+    handle_error(err);
+
+  float elapsed;
+  if (hipError_t err = hipEventElapsedTime(&elapsed, start, stop))
+    handle_error(err);
+  printf("Took %f ms to ping %d times\n", elapsed, PINGS);
 }
